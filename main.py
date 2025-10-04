@@ -3,7 +3,7 @@ import sqlite3
 import os
 from datetime import datetime, timedelta
 from flask import Flask, request
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,18 +26,20 @@ SET_REMINDER, SET_TIME = range(2)
 # Инициализация Flask
 app = Flask(__name__)
 
-# Глобальное приложение Telegram
+# Получение токена и URL из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не установлен в переменных окружения")
+    raise ValueError("❌ Переменная BOT_TOKEN не установлена")
+if not WEBHOOK_URL:
+    raise ValueError("❌ Переменная WEBHOOK_URL не установлена")
 
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://napominalshik2.onrender.com/webhook
-
-# Инициализация Application
+# Создание Application
 application = Application.builder().token(BOT_TOKEN).build()
 
-# Инициализация БД
+# === Работа с базой данных ===
+
 def init_db():
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
@@ -54,9 +56,8 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована")
+    logger.info("✅ База данных инициализирована")
 
-# Сохранение напоминания
 def save_reminder(user_id: int, chat_id: int, text: str, time: str):
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
@@ -67,10 +68,9 @@ def save_reminder(user_id: int, chat_id: int, text: str, time: str):
     reminder_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    logger.info(f"Сохранено напоминание {reminder_id} для user {user_id}: {text} в {time}")
+    logger.info(f"💾 Сохранено напоминание {reminder_id} для {user_id}: {text} в {time}")
     return reminder_id
 
-# Получение активных напоминаний пользователя
 def get_user_reminders(user_id: int):
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
@@ -82,7 +82,6 @@ def get_user_reminders(user_id: int):
     conn.close()
     return reminders
 
-# Получение напоминаний, готовых к отправке
 def get_pending_reminders():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
@@ -95,18 +94,18 @@ def get_pending_reminders():
     conn.close()
     return reminders
 
-# Пометить как отправленное
 def mark_reminder_sent(reminder_id: int):
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("UPDATE reminders SET status = 'sent' WHERE id = ?", (reminder_id,))
     conn.commit()
     conn.close()
-    logger.info(f"Напоминание {reminder_id} помечено как отправленное")
+    logger.info(f"✅ Напоминание {reminder_id} помечено как отправленное")
 
 # === Обработчики команд ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"📩 Получена команда /start от {update.effective_user.id}")
     keyboard = [["📝 Создать напоминание", "📋 Мои напоминания"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
@@ -236,9 +235,8 @@ def setup_handlers():
 
 # === Flask эндпоинты ===
 
-@app.route(WEBHOOK_PATH, methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def telegram_webhook():
-    # Обработка входящих обновлений от Telegram
     application.update_queue.put_nowait(
         Update.de_json(request.get_json(force=True), application.bot)
     )
@@ -246,38 +244,40 @@ def telegram_webhook():
 
 @app.route("/check", methods=["GET"])
 def check_reminders():
-    """Эндпоинт для внешнего cron (вызывается каждые 2-5 минут)"""
     try:
         pending = get_pending_reminders()
-        logger.info(f"Найдено {len(pending)} напоминаний для отправки")
+        logger.info(f"🔍 Найдено {len(pending)} напоминаний для отправки")
         for reminder_id, chat_id, text in pending:
             try:
                 application.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
                 mark_reminder_sent(reminder_id)
-                logger.info(f"Отправлено напоминание {reminder_id}")
+                logger.info(f"📤 Отправлено напоминание {reminder_id}")
             except Exception as e:
-                logger.error(f"Ошибка отправки {reminder_id}: {e}")
+                logger.error(f"❌ Ошибка отправки {reminder_id}: {e}")
         return {"status": "ok", "sent": len(pending)}
     except Exception as e:
-        logger.error(f"Ошибка в /check: {e}")
+        logger.error(f"🔥 Ошибка в /check: {e}")
         return {"status": "error", "message": str(e)}, 500
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return "Bot is running (webhook mode)."
+    return "✅ Bot is running (webhook mode)."
 
-# === Запуск ===
+# === Запуск приложения ===
 if __name__ == "__main__":
     init_db()
     setup_handlers()
 
-    # Установка webhook (выполняется один раз при старте)
+    # Критически важно: инициализировать Application для webhook
     import asyncio
-    async def set_webhook():
+    async def start_bot():
+        await application.initialize()
+        await application.start()
         await application.bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook установлен на {WEBHOOK_URL}")
-    asyncio.run(set_webhook())
+        logger.info(f"🔗 Webhook установлен на {WEBHOOK_URL}")
+
+    asyncio.run(start_bot())
 
     # Запуск Flask
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
