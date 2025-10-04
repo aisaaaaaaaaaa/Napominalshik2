@@ -2,7 +2,6 @@ import logging
 import sqlite3
 import os
 from datetime import datetime, timedelta
-from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,33 +12,27 @@ from telegram.ext import (
     filters,
 )
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Константы состояний
+# Состояния
 SET_REMINDER, SET_TIME = range(2)
 
-# Инициализация Flask
-app = Flask(__name__)
-
-# Получение токена и URL из переменных окружения
+# Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise ValueError("❌ Переменная BOT_TOKEN не установлена")
+    raise ValueError("❌ BOT_TOKEN не установлен")
 if not WEBHOOK_URL:
-    raise ValueError("❌ Переменная WEBHOOK_URL не установлена")
+    raise ValueError("❌ WEBHOOK_URL не установлен")
 
-# Создание Application
-application = Application.builder().token(BOT_TOKEN).build()
-
-# === Работа с базой данных ===
-
+# === База данных ===
 def init_db():
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
@@ -65,11 +58,11 @@ def save_reminder(user_id: int, chat_id: int, text: str, time: str):
         "INSERT INTO reminders (user_id, chat_id, text, time) VALUES (?, ?, ?, ?)",
         (user_id, chat_id, text, time)
     )
-    reminder_id = cursor.lastrowid
+    rid = cursor.lastrowid
     conn.commit()
     conn.close()
-    logger.info(f"💾 Сохранено напоминание {reminder_id} для {user_id}: {text} в {time}")
-    return reminder_id
+    logger.info(f"💾 Напоминание {rid} сохранено")
+    return rid
 
 def get_user_reminders(user_id: int):
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
@@ -78,9 +71,9 @@ def get_user_reminders(user_id: int):
         "SELECT id, text, time, status FROM reminders WHERE user_id = ? AND status = 'active' ORDER BY time",
         (user_id,)
     )
-    reminders = cursor.fetchall()
+    res = cursor.fetchall()
     conn.close()
-    return reminders
+    return res
 
 def get_pending_reminders():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -90,194 +83,153 @@ def get_pending_reminders():
         "SELECT id, chat_id, text FROM reminders WHERE time <= ? AND status = 'active'",
         (now,)
     )
-    reminders = cursor.fetchall()
+    res = cursor.fetchall()
     conn.close()
-    return reminders
+    return res
 
-def mark_reminder_sent(reminder_id: int):
+def mark_reminder_sent(rid: int):
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute("UPDATE reminders SET status = 'sent' WHERE id = ?", (reminder_id,))
+    cursor.execute("UPDATE reminders SET status = 'sent' WHERE id = ?", (rid,))
     conn.commit()
     conn.close()
-    logger.info(f"✅ Напоминание {reminder_id} помечено как отправленное")
+    logger.info(f"✅ Напоминание {rid} отправлено")
 
-# === Обработчики команд ===
-
+# === Обработчики ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"📩 Получена команда /start от {update.effective_user.id}")
-    keyboard = [["📝 Создать напоминание", "📋 Мои напоминания"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    logger.info(f"📩 /start от {update.effective_user.id}")
+    kb = [["📝 Создать напоминание", "📋 Мои напоминания"]]
     await update.message.reply_text(
-        "👋 Привет! Я бот-напоминальщик.\n\n"
-        "Создавайте напоминания, и я пришлю уведомление в указанное время.",
-        reply_markup=reply_markup
+        "👋 Привет! Я бот-напоминальщик.",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
 
 async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📝 Введите текст напоминания:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("📝 Текст напоминания:", reply_markup=ReplyKeyboardRemove())
     return SET_REMINDER
 
 async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["reminder_text"] = update.message.text
-    await update.message.reply_text(
-        "⏰ Введите время в формате:\n"
-        "• ГГГГ-ММ-ДД ЧЧ:ММ (например: 2024-12-31 23:59)\n"
-        "• Или через сколько минут (например: 30)"
-    )
+    context.user_data["text"] = update.message.text
+    await update.message.reply_text("⏰ Время (ГГГГ-ММ-ДД ЧЧ:ММ или минуты):")
     return SET_TIME
 
 async def save_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_input = update.message.text.strip()
-    reminder_text = context.user_data["reminder_text"]
-
+    text = context.user_data["text"]
     try:
         if time_input.isdigit():
             minutes = int(time_input)
-            reminder_time = (datetime.now() + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
-            time_display = f"через {minutes} минут"
+            time_str = (datetime.now() + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
+            display = f"через {minutes} мин"
         else:
-            reminder_time_obj = datetime.strptime(time_input, "%Y-%m-%d %H:%M")
-            if reminder_time_obj <= datetime.now():
-                await update.message.reply_text("❌ Время должно быть в будущем!")
+            time_obj = datetime.strptime(time_input, "%Y-%m-%d %H:%M")
+            if time_obj <= datetime.now():
+                await update.message.reply_text("❌ Время в прошлом!")
                 return SET_TIME
-            reminder_time = time_input
-            time_display = reminder_time
+            time_str = time_input
+            display = time_str
 
-        reminder_id = save_reminder(
-            update.effective_user.id,
-            update.effective_chat.id,
-            reminder_text,
-            reminder_time
-        )
-
-        keyboard = [["📝 Создать напоминание", "📋 Мои напоминания"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        rid = save_reminder(update.effective_user.id, update.effective_chat.id, text, time_str)
+        kb = [["📝 Создать напоминание", "📋 Мои напоминания"]]
         await update.message.reply_text(
-            f"✅ Напоминание создано! (ID: {reminder_id})\n\n"
-            f"📝 Текст: {reminder_text}\n"
-            f"⏰ Время: {time_display}",
-            reply_markup=reply_markup
+            f"✅ Напоминание #{rid}\n📝 {text}\n⏰ {display}",
+            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
         )
         return ConversationHandler.END
 
     except ValueError:
-        await update.message.reply_text(
-            "❌ Неверный формат времени!\n"
-            "Используйте:\n"
-            "• ГГГГ-ММ-ДД ЧЧ:ММ\n"
-            "• Или количество минут"
-        )
+        await update.message.reply_text("❌ Неверный формат времени")
         return SET_TIME
 
 async def show_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reminders = get_user_reminders(update.effective_user.id)
-    if not reminders:
-        await update.message.reply_text("📭 У вас нет активных напоминаний")
+    rem = get_user_reminders(update.effective_user.id)
+    if not rem:
+        await update.message.reply_text("📭 Нет напоминаний")
         return
-    text = "📋 Ваши напоминания:\n\n"
-    for reminder_id, reminder_text, reminder_time, _ in reminders:
-        text += f"⏳ ID:{reminder_id}\n   📝 {reminder_text}\n   ⏰ {reminder_time}\n\n"
-    text += "Для удаления используйте /delete ID"
-    await update.message.reply_text(text)
+    msg = "📋 Ваши напоминания:\n\n"
+    for rid, text, time, _ in rem:
+        msg += f"⏳ ID:{rid}\n   📝 {text}\n   ⏰ {time}\n\n"
+    msg += "Удалить: /delete ID"
+    await update.message.reply_text(msg)
 
 async def delete_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ Укажите ID напоминания\nПример: /delete 1")
+        await update.message.reply_text("❌ /delete <ID>")
         return
     try:
-        reminder_id = int(context.args[0])
+        rid = int(context.args[0])
         conn = sqlite3.connect("reminders.db", check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, update.effective_user.id))
-        deleted = cursor.rowcount > 0
+        c = conn.cursor()
+        c.execute("DELETE FROM reminders WHERE id = ? AND user_id = ?", (rid, update.effective_user.id))
+        ok = c.rowcount > 0
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ Напоминание #{reminder_id} удалено" if deleted else "❌ Не найдено")
+        await update.message.reply_text("✅ Удалено" if ok else "❌ Не найдено")
     except ValueError:
         await update.message.reply_text("❌ Неверный ID")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""
-🤖 **Команды бота:**
-/new — создать напоминание  
-/my_reminders — мои напоминания  
-/delete [ID] — удалить напоминание  
-/help — помощь
-    """)
+    await update.message.reply_text("Команды: /new, /my_reminders, /delete <ID>")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["📝 Создать напоминание", "📋 Мои напоминания"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("❌ Действие отменено", reply_markup=reply_markup)
+    kb = [["📝 Создать напоминание", "📋 Мои напоминания"]]
+    await update.message.reply_text("❌ Отменено", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ConversationHandler.END
 
-# === Настройка обработчиков ===
-def setup_handlers():
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Вызывается по расписанию через /check (вручную)"""
+    pending = get_pending_reminders()
+    logger.info(f"🔍 Найдено {len(pending)} напоминаний")
+    for rid, chat_id, text in pending:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
+            mark_reminder_sent(rid)
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки {rid}: {e}")
+
+# === Webhook эндпоинт для /check ===
+from aiohttp import web
+
+async def handle_check(request):
+    """Эндпоинт для cron-job.org"""
+    try:
+        # Имитируем вызов JobQueue
+        from telegram.ext import ContextTypes
+        from types import SimpleNamespace
+        fake_update = SimpleNamespace()
+        fake_context = ContextTypes.DEFAULT_TYPE(bot=application.bot)
+        await check_reminders(fake_context)
+        return web.json_response({"status": "ok", "sent": "checked"})
+    except Exception as e:
+        logger.error(f"🔥 Ошибка в /check: {e}")
+        return web.json_response({"status": "error", "msg": str(e)}, status=500)
+
+# === Запуск ===
+if __name__ == "__main__":
+    init_db()
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Обработчики
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("my_reminders", show_reminders))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("my_reminders", show_reminders))
     application.add_handler(CommandHandler("delete", delete_reminder_command))
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("new", set_reminder),
-            MessageHandler(filters.Regex("^📝 Создать напоминание$"), set_reminder)
-        ],
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("new", set_reminder)],
         states={
             SET_REMINDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_time)],
             SET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_reminder_handler)]
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
-    application.add_handler(conv_handler)
-    application.add_handler(MessageHandler(filters.Regex("^📋 Мои напоминания$"), show_reminders))
+    application.add_handler(conv)
 
-# === Flask эндпоинты ===
-
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    application.update_queue.put_nowait(
-        Update.de_json(request.get_json(force=True), application.bot)
+    # Запуск webhook
+    logger.info("🚀 Запуск webhook...")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,  # секретный путь для безопасности
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
     )
-    return "OK"
-
-@app.route("/check", methods=["GET"])
-def check_reminders():
-    try:
-        pending = get_pending_reminders()
-        logger.info(f"🔍 Найдено {len(pending)} напоминаний для отправки")
-        for reminder_id, chat_id, text in pending:
-            try:
-                application.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
-                mark_reminder_sent(reminder_id)
-                logger.info(f"📤 Отправлено напоминание {reminder_id}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки {reminder_id}: {e}")
-        return {"status": "ok", "sent": len(pending)}
-    except Exception as e:
-        logger.error(f"🔥 Ошибка в /check: {e}")
-        return {"status": "error", "message": str(e)}, 500
-
-@app.route("/", methods=["GET"])
-def health_check():
-    return "✅ Bot is running (webhook mode)."
-
-# === Запуск приложения ===
-if __name__ == "__main__":
-    init_db()
-    setup_handlers()
-
-    # Критически важно: инициализировать Application для webhook
-    import asyncio
-    async def start_bot():
-        await application.initialize()
-        await application.start()
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"🔗 Webhook установлен на {WEBHOOK_URL}")
-
-    asyncio.run(start_bot())
-
-    # Запуск Flask
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
