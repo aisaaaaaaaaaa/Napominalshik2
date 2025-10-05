@@ -3,3 +3,4 @@ APScheduler==3.10.4
 httpx==0.28.1
 pytz
 tzlocal
+dateparser==1.2.0
