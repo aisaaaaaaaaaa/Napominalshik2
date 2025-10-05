@@ -1,140 +1,276 @@
 import os
 import logging
+import sqlite3
 import asyncio
 from datetime import datetime
 
-import dateparser
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
 
-# ==============================
-# ЛОГИ
-# ==============================
+from apscheduler.schedulers.background import BackgroundScheduler
+import dateparser
+
+# ===================== Логирование =====================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==============================
-# ХРАНИЛИЩЕ НАПОМИНАНИЙ (в памяти)
-# ==============================
-reminders = {}  # {chat_id: [(time, text)]}
+# ===================== Конфигурация =====================
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://napominalshik2.onrender.com/webhook")
+PORT = int(os.getenv("PORT", 10000))
 
+DB_FILE = "reminders.db"
 
-# ==============================
-# КОМАНДЫ
-# ==============================
+# ===================== Работа с БД =====================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS reminders
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  chat_id INTEGER,
+                  text TEXT,
+                  remind_time TEXT,
+                  sent INTEGER DEFAULT 0)''')
+    conn.commit()
+    conn.close()
+
+def add_reminder(chat_id, text, remind_time):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO reminders (chat_id, text, remind_time) VALUES (?, ?, ?)",
+              (chat_id, text, remind_time))
+    conn.commit()
+    conn.close()
+
+def get_due_reminders():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("SELECT id, chat_id, text FROM reminders WHERE remind_time<=? AND sent=0", (now,))
+    reminders = c.fetchall()
+    conn.close()
+    return reminders
+
+def mark_reminder_sent(reminder_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE reminders SET sent=1 WHERE id=?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+# ===================== Основные хендлеры =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот-напоминальщик.\n"
-        "Напиши что-то вроде:\n\n"
-        "👉 напомни завтра в 10:00 сходить в магазин\n"
-        "👉 напомни через 5 минут проверить чайник"
+        "Привет! Я бот-напоминальщик.\n"
+        "Напиши мне что-то вроде:\n"
+        "👉 'напомни завтра в 10:00 сходить в магазин'"
     )
 
-
-async def new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✍ Введи напоминание в формате: напомни [время] [текст]")
-
-
-# ==============================
-# ДОБАВЛЕНИЕ НАПОМИНАНИЯ
-# ==============================
-async def add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     chat_id = update.message.chat_id
-    text = update.message.text.lower()
 
-    if not text.startswith("напомни"):
-        return
+    # Парсим дату и время
+    remind_time = dateparser.parse(text, languages=["ru"])
+    if remind_time:
+        add_reminder(chat_id, text, remind_time.strftime("%Y-%m-%d %H:%M:%S"))
+        await update.message.reply_text(f"✅ Напоминание сохранено: {text}")
+    else:
+        await update.message.reply_text("⏰ Не понял время напоминания, попробуй иначе!")
 
-    # убираем слово "напомни"
-    reminder_text = text.replace("напомни", "", 1).strip()
-
-    # парсим время
-    reminder_time = dateparser.parse(reminder_text, languages=["ru"], settings={"PREFER_DATES_FROM": "future"})
-
-    if not reminder_time:
-        await update.message.reply_text("⚠ Не понял время. Попробуй так: 'напомни завтра в 10:00 купить хлеб'.")
-        return
-
-    # убираем время из текста напоминания
-    clean_text = reminder_text.replace(str(reminder_time.date()), "").strip()
-
-    reminders.setdefault(chat_id, []).append((reminder_time, clean_text))
-
-    await update.message.reply_text(
-        f"✅ Напоминание создано!\n"
-        f"🕒 Когда: {reminder_time.strftime('%Y-%m-%d %H:%M')}\n"
-        f"📌 Что: {clean_text}"
-    )
-    logger.info(f"Создано напоминание для {chat_id}: {reminder_time} -> {clean_text}")
-
-
-# ==============================
-# ПРОВЕРКА НАПОМИНАНИЙ
-# ==============================
+# ===================== Проверка напоминаний =====================
 async def check_reminders_job(application: Application):
-    now = datetime.now()
-    for chat_id, user_reminders in list(reminders.items()):
-        for reminder_time, text in user_reminders[:]:
-            if reminder_time <= now:
-                try:
-                    await application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
-                except Exception as e:
-                    logger.error(f"Ошибка при отправке напоминания: {e}")
-                user_reminders.remove((reminder_time, text))
+    reminders = get_due_reminders()
+    for reminder_id, chat_id, text in reminders:
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
+            mark_reminder_sent(reminder_id)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке напоминания: {e}")
 
-
-# ==============================
-# ЗАПУСК ПЛАНИРОВЩИКА
-# ==============================
+# ===================== Планировщик =====================
 def start_scheduler(application: Application):
     scheduler = BackgroundScheduler()
 
-    # теперь используем application.create_task вместо asyncio.create_task
     def job():
-        application.create_task(check_reminders_job(application))
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                check_reminders_job(application), loop
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в job: {e}")
 
-    scheduler.add_job(job, trigger=IntervalTrigger(minutes=1))
+    scheduler.add_job(job, "interval", minutes=1)
     scheduler.start()
     logger.info("🕒 Планировщик запущен")
 
-
-# ==============================
-# MAIN
-# ==============================
+# ===================== Запуск =====================
 def main():
-    TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://napominalshik2.onrender.com/webhook")
-    PORT = int(os.getenv("PORT", 10000))
+    init_db()
 
     application = Application.builder().token(TOKEN).build()
 
-    # команды
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("new", new))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # обработка текста
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_reminder))
-
-    # запускаем планировщик
+    # Запускаем планировщик
     start_scheduler(application)
 
-    # запуск через webhook (Render)
     logger.info("🚀 Запуск через Webhook...")
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="/webhook",
-        webhook_url=WEBHOOK_URL
+        url_path="webhook",
+        webhook_url=WEBHOOK_URL,
     )
 
+if __name__ == "__main__":
+    main()
+import os
+import logging
+import sqlite3
+import asyncio
+from datetime import datetime
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
+from apscheduler.schedulers.background import BackgroundScheduler
+import dateparser
+
+# ===================== Логирование =====================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ===================== Конфигурация =====================
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://napominalshik2.onrender.com/webhook")
+PORT = int(os.getenv("PORT", 10000))
+
+DB_FILE = "reminders.db"
+
+# ===================== Работа с БД =====================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS reminders
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  chat_id INTEGER,
+                  text TEXT,
+                  remind_time TEXT,
+                  sent INTEGER DEFAULT 0)''')
+    conn.commit()
+    conn.close()
+
+def add_reminder(chat_id, text, remind_time):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO reminders (chat_id, text, remind_time) VALUES (?, ?, ?)",
+              (chat_id, text, remind_time))
+    conn.commit()
+    conn.close()
+
+def get_due_reminders():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("SELECT id, chat_id, text FROM reminders WHERE remind_time<=? AND sent=0", (now,))
+    reminders = c.fetchall()
+    conn.close()
+    return reminders
+
+def mark_reminder_sent(reminder_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE reminders SET sent=1 WHERE id=?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+# ===================== Основные хендлеры =====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я бот-напоминальщик.\n"
+        "Напиши мне что-то вроде:\n"
+        "👉 'напомни завтра в 10:00 сходить в магазин'"
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.message.chat_id
+
+    # Парсим дату и время
+    remind_time = dateparser.parse(text, languages=["ru"])
+    if remind_time:
+        add_reminder(chat_id, text, remind_time.strftime("%Y-%m-%d %H:%M:%S"))
+        await update.message.reply_text(f"✅ Напоминание сохранено: {text}")
+    else:
+        await update.message.reply_text("⏰ Не понял время напоминания, попробуй иначе!")
+
+# ===================== Проверка напоминаний =====================
+async def check_reminders_job(application: Application):
+    reminders = get_due_reminders()
+    for reminder_id, chat_id, text in reminders:
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
+            mark_reminder_sent(reminder_id)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке напоминания: {e}")
+
+# ===================== Планировщик =====================
+def start_scheduler(application: Application):
+    scheduler = BackgroundScheduler()
+
+    def job():
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                check_reminders_job(application), loop
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в job: {e}")
+
+    scheduler.add_job(job, "interval", minutes=1)
+    scheduler.start()
+    logger.info("🕒 Планировщик запущен")
+
+# ===================== Запуск =====================
+def main():
+    init_db()
+
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Запускаем планировщик
+    start_scheduler(application)
+
+    logger.info("🚀 Запуск через Webhook...")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="webhook",
+        webhook_url=WEBHOOK_URL,
+    )
 
 if __name__ == "__main__":
     main()
