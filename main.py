@@ -12,16 +12,18 @@ from telegram.ext import (
     filters,
 )
 
+# === Логирование ===
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# === Константы ===
 SET_REMINDER, SET_TIME = range(2)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://napominalshik2.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN or not WEBHOOK_URL:
@@ -47,7 +49,10 @@ def init_db():
 def save_reminder(user_id, chat_id, text, time):
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO reminders (user_id, chat_id, text, time) VALUES (?, ?, ?, ?)", (user_id, chat_id, text, time))
+    cursor.execute(
+        "INSERT INTO reminders (user_id, chat_id, text, time) VALUES (?, ?, ?, ?)",
+        (user_id, chat_id, text, time)
+    )
     rid = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -57,7 +62,10 @@ def get_pending_reminders():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     conn = sqlite3.connect("reminders.db", check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, chat_id, text FROM reminders WHERE time <= ? AND status = 'active'", (now,))
+    cursor.execute(
+        "SELECT id, chat_id, text FROM reminders WHERE time <= ? AND status = 'active'",
+        (now,)
+    )
     res = cursor.fetchall()
     conn.close()
     return res
@@ -73,15 +81,18 @@ def mark_reminder_sent(rid):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📩 /start от {update.effective_user.id}")
     kb = [["📝 Создать напоминание"]]
-    await update.message.reply_text("👋 Привет!", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    await update.message.reply_text(
+        "👋 Привет! Я твой напоминальщик 🚀",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
 
 async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📝 Текст:", reply_markup=ReplyKeyboardMarkup(remove_keyboard=True))
+    await update.message.reply_text("📝 Напиши текст напоминания:")
     return SET_REMINDER
 
 async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["text"] = update.message.text
-    await update.message.reply_text("⏰ Время (минуты или ГГГГ-ММ-ДД ЧЧ:ММ):")
+    await update.message.reply_text("⏰ Укажи время (минуты или ГГГГ-ММ-ДД ЧЧ:ММ):")
     return SET_TIME
 
 async def save_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,7 +113,7 @@ async def save_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"✅ Напоминание #{rid} создано!")
         return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат")
+        await update.message.reply_text("❌ Неверный формат. Попробуй ещё раз.")
         return SET_TIME
 
 # === Проверка напоминаний через JobQueue ===
@@ -132,7 +143,7 @@ if __name__ == "__main__":
     )
     app.add_handler(conv)
 
-    # Добавляем задачу проверки каждые 60 секунд
+    # Проверка напоминаний каждую минуту
     app.job_queue.run_repeating(check_reminders_job, interval=60, first=10)
 
     # Запуск webhook
@@ -140,6 +151,6 @@ if __name__ == "__main__":
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_url=f"{WEBHOOK_URL}",
-        secret_token=None  # или добавь, если хочешь безопасность
+        webhook_url=f"{WEBHOOK_URL}/webhook",  # <<< ВАЖНО: добавлен /webhook
+        secret_token=None
     )
