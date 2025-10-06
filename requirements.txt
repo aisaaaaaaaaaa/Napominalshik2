@@ -4,3 +4,4 @@ httpx==0.28.1
 pytz
 tzlocal
 dateparser==1.2.0
+sqlalchemy==2.0.36   
